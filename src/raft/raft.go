@@ -20,7 +20,7 @@ package raft
 import "sync"
 import "sync/atomic"
 import "../labrpc"
-
+import "sort"
 import "math/rand"
 import "time"
 // import "bytes"
@@ -185,7 +185,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	// 不投票: 1.Candidate的term小于节点的currentTrem 2.节点已经投过票，并且投票的对象不是发起该次请求的候选人
+	// 不投票: 1.Candidate的term小于节点的currentTrem 2.节点已经投过票，并且已经投票的对象不是发起该次请求的候选人
 	if (args.Term < rf.currentTerm) || (rf.votedFor != NULL && rf.votedFor != args.CandidateId) {
 		return
 	// 不投票: 候选人的日志没有节点新
@@ -211,7 +211,7 @@ type AppendEntriesArgs struct {
 	LeaderId     int        // 2A, Leader的id，因此Follower可以对客户端重定向
 	PrevLogIndex int        // 2B, 紧邻新log之前的那个日志条目的索引
 	PrevLogTerm  int        // 2B, 紧邻新log之前的那个日志条目的term
-	LogEntries   []Log      // 2B, 需要被保存的日志条目(可以发送多个)
+	Entries      []Log      // 2B, 需要被保存的日志条目(可以发送多个)
 	LeaderCommit int        // 2B, Leader已提交的最高日志条目的索引
 }
 
@@ -225,7 +225,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// 收到leader的追加条目RPC（也有心跳功能），需要重置选举定时器，因此发送channel
+	// 如果选举超时后没有从当前leader接收到AppendEntries RPC
 	defer send(rf.appendLogCh)
 	// all server rule 1 If RPC request or response contains term T > currentTerm:
 	if args.Term > rf.currentTerm {
@@ -233,17 +233,46 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	reply.Term = rf.currentTerm
 	reply.Success = false
-	// 接收者的实现 1.领导者的任期小于接收者的当前任期
-	if args.Term < rf.currentTerm{
-		return
-	// 接收者的实现 2.
-	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		return
-	} else {
-		reply.Success = true
+	// 1. 返回假，如果领导者的任期 小于 接收者的当前任期（5.1 节）
+	if args.Term < rf.currentTerm {return}
+	//2. 返回假，如果接收者日志中没有包含这样一个条目:该条目在prevLogIndex上的Term和prevLogTerm匹配 (§5.3)
+	prevLogIndexTerm := -1
+	if args.PrevLogIndex >= 0 && args.PrevLogIndex < len(rf.log) {
+		prevLogIndexTerm = rf.log[args.PrevLogIndex].Term
 	}
+	if prevLogIndexTerm != args.PrevLogTerm {
+		return
+	}
+    // 3.如果一个已经存在的条目和新条目发生了冲突(因为索引相同,任期不同),那么就删除这个存在的条目以及它之后的所有条目(5.3节)
+	index := args.PrevLogIndex
+	for i := 0; i < len(args.Entries); i++ {
+		index++
+		if index >= len(rf.log) {
+			//4. 追加日志中尚未存在的任何新条目
+			rf.log = append(rf.log, args.Entries[i:]...)
+			break
+		}
+		if rf.log[index].Term != args.Entries[i].Term {
+			rf.log = rf.log[:index]
+			//4. 追加日志中尚未存在的任何新条目
+			rf.log = append(rf.log,args.Entries[i:]...)
+			break
+		}
+	}
+	// 5.如果领导者的已知已经提交的最高的日志条目的索引leaderCommit 大于 接收者的已知提交的最高日志条目的索引commitIndex,
+	// 则把接收者的commitIndex 重置为 min(leaderCommit, 上一个新条目的索引)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = Min(args.LeaderCommit ,rf.getLastLogIdx())
+		rf.updateLastApplied()
+	}
+	reply.Success = true
+}
 
-
+func Min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
 }
 
 /*
@@ -295,6 +324,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func send(ch chan bool) {
+	select {
+	case <-ch: //if already set, consume it then resent to avoid block
+	default:
+	}
+	ch <- true
+}
+
 // Follower Section:
 func (rf *Raft) beFollower(term int) {
 	rf.state = Follower
@@ -327,13 +364,6 @@ func (rf *Raft) beLeader() {
 	}
 }  //end Leader section
 
-func send(ch chan bool) {
-	select {
-	case <-ch: // 如果已经设置，消耗它然后重新发送以避免阻塞
-	default:
-	}
-	ch <- true
-}
 
 func (rf *Raft) getLastLogIdx() int {
 	return len(rf.log) - 1
@@ -367,8 +397,7 @@ func (rf *Raft) startElection() {
 		rf.me,
 		rf.getLastLogIdx(),
 		rf.getLastLogTerm(),
-
-	};
+	}
 	rf.mu.Unlock()
 	var votes int32 = 1;
 	for i := 0; i < len(rf.peers); i++ {
@@ -386,6 +415,7 @@ func (rf *Raft) startElection() {
 				// 将currentTerm置为选票结果中的Term，并且节点转为Follower
 				if reply.Term > rf.currentTerm {
 					rf.beFollower(reply.Term)
+					// send(rf.voteCh)  // 此时不发送rpc的原因是，return后会立即开始下一轮for循环
 					return
 				}
 				if rf.state != Candidate || rf.currentTerm != args.Term{
@@ -396,7 +426,8 @@ func (rf *Raft) startElection() {
 				}  // 得到半数以上的选票，节点就转为Leader
 				if atomic.LoadInt32(&votes) > int32(len(rf.peers) / 2) {
 					rf.beLeader()
-					send(rf.voteCh) //after be leader, then notify 'select' goroutine will sending out heartbeats immediately
+					//在成为leader之后，通知'select' goroutine立即发送心跳
+					send(rf.voteCh)
 				}
 			}
 		}(i)
@@ -422,14 +453,15 @@ func (rf *Raft) startAppendLog() {
 					rf.me,
 					rf.getPrevLogIdx(idx),
 					rf.getPrevLogTerm(idx),
-					make([]Log,0),  // 发送空log，作为心跳
+					// 对于一个跟随者idx，Leader要发送给他的日志条目为：从nextIndex[idx]到日志结尾
+					append(make([]Log,0),rf.log[rf.nextIndex[idx]:]...),
 					rf.commitIndex,
 				}
 				rf.mu.Unlock()
 				reply := &AppendEntriesReply{}
 				ret := rf.sendAppendEntries(idx, &args, reply)
 				rf.mu.Lock()
-				if !ret {
+				if !ret || rf.state != Leader || rf.currentTerm != args.Term {
 					rf.mu.Unlock()
 					return
 				}
@@ -439,13 +471,52 @@ func (rf *Raft) startAppendLog() {
 					rf.mu.Unlock()
 					return
 				}
-				rf.mu.Unlock()
+				// 如果节点回复成功：更新对该节点的 nextIndex 和 matchIndex, 提交该索引的日志
+				if reply.Success {
+					rf.matchIndex[idx] = args.PrevLogIndex + len(args.Entries)
+					rf.nextIndex[idx] = rf.matchIndex[idx] + 1
+					rf.updateCommitIndex()
+					rf.mu.Unlock()
+					return
+				} else {  // 如果由于日志不一致而失败:递减nextIndex，然后重试
+					rf.nextIndex[idx]--
+					rf.mu.Unlock()
+				}
 			}
 		}(i)
 	}
 }
 
+// 提交当前Term的日志
+func (rf *Raft) updateCommitIndex() {
+	rf.matchIndex[rf.me] = len(rf.log) - 1
+	copyMatchIndex := make([]int,len(rf.matchIndex))
+	copy(copyMatchIndex,rf.matchIndex)
+	// 需要反向排序，也就是大的在前面
+	sort.Sort(sort.Reverse(sort.IntSlice(copyMatchIndex)))
+	// 领导人遵守的规则4
+	// len(copyMatchIndex)/2 会向下取整(两个int相除)，如长度为5的切片 ，结果为2，但切片索引从0开始，因此N为最中间的索引值
+	N := copyMatchIndex[len(copyMatchIndex)/2]
+	// 注意，需要检查N处log的Term是否等于当前任期Term，因为Leader不能提交之前Term的日志
+	if N > rf.commitIndex && rf.log[N].Term == rf.currentTerm {
+		rf.commitIndex = N
+		rf.updateLastApplied()
+	}
+}
 
+// 所有服务器规则1：如果 commitIndex > lastApplied，lastApplied + 1, 并应用 log[lastApplied] 到状态机
+func (rf *Raft) updateLastApplied() {
+	for rf.lastApplied < rf.commitIndex {
+		rf.lastApplied++
+		curLog := rf.log[rf.lastApplied]
+		applyMsg := ApplyMsg{
+			true,
+			curLog.Command,
+			rf.lastApplied,
+		}
+		rf.applyCh <- applyMsg
+	}
+}
 
 /*
 // the service using Raft (e.g. a k/v server) wants to start
@@ -468,13 +539,20 @@ func (rf *Raft) startAppendLog() {
 相当于应用该entry的命令到状态机。
 */
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
-
+	term := rf.currentTerm
+	isLeader := (rf.state == Leader)
+	// 如果从客户端接收到命令:将日志条目附加到本地日志，在条目应用到状态机后响应(§5.3)
+	if isLeader {
+		index = rf.getLastLogIdx() + 1  // 初始从 1 开始;log的初始长度为1，getLastLogIdx()为0, 加1后index为1
+		newLog := Log{
+			rf.currentTerm,
+			command,
+		}
+		rf.log = append(rf.log,newLog)
+	}
 	return index, term, isLeader
 }
 
@@ -528,7 +606,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 持久性状态
 	rf.currentTerm = 0
 	rf.votedFor = NULL
-	rf.log = make([]Log,1)  // 注意，log的第一个索引值为1
+	rf.log = make([]Log,1)  // 注意，log的第一个索引为 1。因此这里长度设为 1，调用start()后index的初始值便为1
 	// 易失性状态
 	rf.commitIndex = 0
 	rf.lastApplied = 0
