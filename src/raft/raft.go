@@ -23,8 +23,8 @@ import "../labrpc"
 import "sort"
 import "math/rand"
 import "time"
-// import "bytes"
-// import "../labgob"
+import "bytes"
+import "../labgob"
 
 
 
@@ -95,6 +95,8 @@ type Raft struct {
 	// handler rpc
     voteCh      chan bool
 	appendLogCh chan bool
+
+	killCh      chan bool     //for Kill()
 }
 
 // return currentTerm and whether this server
@@ -119,12 +121,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -137,18 +140,22 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var voteFor int
+	var log []Log
+	if  d.Decode(&currentTerm) != nil || d.Decode(&voteFor) != nil || d.Decode(&log) != nil {
+		DPrintf("readPersist ERROR for server %v", rf.me)
+		// log.Fatal("readPersist ERROR for server %v",rf.me)
+	} else {
+		rf.mu.Lock()
+		rf.currentTerm, rf.votedFor, rf.log = currentTerm, voteFor, log
+		rf.mu.Unlock()
+	}
 }
+
+
 
 
 //
@@ -199,6 +206,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.state = Follower
+		rf.persist()
 		// 投票后要重置选举定时器
 		send(rf.voteCh)
 	}
@@ -218,6 +226,18 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term         int        // 2A，节点的当前任期号，以便更新落后候选人的任期号
 	Success      bool       // 2A，如果Follower所含有的日志条目和PrevLogIndex以及PrevLogTerm匹配上了，则为真
+	ConflictIndex int       // 冲突任期的最早的索引（视频中的XIndex）
+	ConflictTerm  int       // 冲突日志条目的任期号（视频中的XTerm）
+	/*
+	跟随者实现（AppendEntries()中）：
+	- 如果跟随者的日志中没有prevLogIndex(即跟随者的日志比领导者短)：
+	  以conflictIndex = len(log)（即跟随者的最后一条日志条目+1） 和 conflictTerm = None返回。
+	- 如果跟随者的日志中有prevLogIndex，但该任期不匹配，
+	  它应该返回conflictTerm = log[pevLogIndex].Term，然后在其日志中搜索其任期等于conflictTerm的条目的第一个索引。
+	领导者实现（startAppendLog()中）：收到冲突的响应后，领导者应该首先在其日志中搜索conflictTerm。
+	- 如果在日志中找到了一个具有该任期的条目，它应该将nextIndex设置为 等于该任期的最后一个条目的索引 + 1。(视频case2)
+	- 如果conflictTerm为空 或者 没有找到具有那个任期的条目，应该设置nextIndex = conflictIndex。(视频case3和case1)
+	*/
 }
 
 // AppendEntries RPC handler.
@@ -233,14 +253,35 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	reply.Term = rf.currentTerm
 	reply.Success = false
+	reply.ConflictTerm = NULL
+	reply.ConflictIndex = 0
 	// 1. 返回假，如果领导者的任期 小于 接收者的当前任期（5.1 节）
 	if args.Term < rf.currentTerm {return}
 	//2. 返回假，如果接收者日志中没有包含这样一个条目:该条目在prevLogIndex上的Term和prevLogTerm匹配 (§5.3)
 	prevLogIndexTerm := -1
+	logSize := len(rf.log)
 	if args.PrevLogIndex >= 0 && args.PrevLogIndex < len(rf.log) {
 		prevLogIndexTerm = rf.log[args.PrevLogIndex].Term
 	}
+	// 2C 快速恢复
 	if prevLogIndexTerm != args.PrevLogTerm {
+		reply.ConflictIndex = logSize
+		// 如果跟随者的日志中没有prevLogIndex，
+		if prevLogIndexTerm == -1 {
+			// 它应该返回 conflictIndex = len(log) 以及 conflictTerm = None.（两者皆为初始化值）
+		} else {  // 如果跟随者在其日志中有prevLogIndex，但Term不匹配
+			// 返回 conflictTerm = log[prevLogIndex].Term
+			reply.ConflictTerm = prevLogIndexTerm
+			i := 0
+			// 然后搜索日志
+			for ; i < logSize; i++ {
+				if rf.log[i].Term == reply.ConflictTerm {
+					// 找到任期等于conflictTerm的条目的第一个索引，并返回之
+					reply.ConflictIndex = i
+					break
+				}
+			}
+		}
 		return
 	}
     // 3.如果一个已经存在的条目和新条目发生了冲突(因为索引相同,任期不同),那么就删除这个存在的条目以及它之后的所有条目(5.3节)
@@ -250,12 +291,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if index >= len(rf.log) {
 			//4. 追加日志中尚未存在的任何新条目
 			rf.log = append(rf.log, args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 		if rf.log[index].Term != args.Entries[i].Term {
 			rf.log = rf.log[:index]
 			//4. 追加日志中尚未存在的任何新条目
 			rf.log = append(rf.log,args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 	}
@@ -337,6 +380,7 @@ func (rf *Raft) beFollower(term int) {
 	rf.state = Follower
 	rf.votedFor = NULL
 	rf.currentTerm = term
+	rf.persist()
 }  // end Follower section
 
 //Candidate Section:
@@ -346,6 +390,7 @@ func (rf *Raft) beCandidate() {
 	rf.state = Candidate
 	rf.currentTerm++   // 增加currentTerm
 	rf.votedFor = rf.me  // 先给自己投票
+	rf.persist()
 	// 向其他节点发送RequestVote rpc，征求选票
 	go rf.startElection()
 }
@@ -418,6 +463,7 @@ func (rf *Raft) startElection() {
 					// send(rf.voteCh)  // 此时不发送rpc的原因是，return后会立即开始下一轮for循环
 					return
 				}
+				// 为了避免任期混乱，在拿到REPLY后要比较rf.currentTerm 和 args.Term，如果两者不一致，则直接退出
 				if rf.state != Candidate || rf.currentTerm != args.Term{
 					return
 				}
@@ -461,6 +507,7 @@ func (rf *Raft) startAppendLog() {
 				reply := &AppendEntriesReply{}
 				ret := rf.sendAppendEntries(idx, &args, reply)
 				rf.mu.Lock()
+				// 为了避免任期混乱，在拿到REPLY后要比较rf.currentTerm 和 args.Term，如果两者不一致，则直接退出，
 				if !ret || rf.state != Leader || rf.currentTerm != args.Term {
 					rf.mu.Unlock()
 					return
@@ -478,8 +525,21 @@ func (rf *Raft) startAppendLog() {
 					rf.updateCommitIndex()
 					rf.mu.Unlock()
 					return
-				} else {  // 如果由于日志不一致而失败:递减nextIndex，然后重试
-					rf.nextIndex[idx]--
+				} else {  // 2C, 快速恢复，不再简单递减nextIndex
+					tarIndex := reply.ConflictIndex
+					// 收到冲突的响应后，领导者应该首先在其日志中搜索conflictTerm。
+					if reply.ConflictTerm != NULL {
+						logSize := len(rf.log)
+						for i := 0; i < logSize; i++ {//if it finds an entry in its log with that term
+							if rf.log[i].Term != reply.ConflictTerm { continue }
+							// 如果在日志中找到了一个具有该任期(ConflictTerm)的条目，将nextIndex设为 等于该任期的最后一个条目的索引+1。
+							for i < logSize && rf.log[i].Term == reply.ConflictTerm { i++ }
+							// i++已经将找到的最后具有该任期(ConflictTerm)的条目索引加了1，因此直接令nextIndex = i即可
+							tarIndex = i
+						}
+					} // 这里隐含着，如果ConflictTerm为空 或者 没有找到具有ConflictTerm的条目，设置nextIndex = conflictIndex
+					// 设置nextIndex
+					rf.nextIndex[idx] = tarIndex
 					rf.mu.Unlock()
 				}
 			}
@@ -552,6 +612,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			command,
 		}
 		rf.log = append(rf.log,newLog)
+		rf.persist()
 	}
 	return index, term, isLeader
 }
@@ -571,6 +632,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	send(rf.killCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -618,7 +680,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     // 因为goroutine只发送chan到下面的goroutine，为了避免阻塞，需要1个缓冲区
     rf.voteCh = make(chan bool, 1)
     rf.appendLogCh = make(chan bool, 1)
-
+	rf.killCh = make(chan bool,1)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -628,6 +690,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 最简单的方法是创建一个带有调用time.Sleep()循环的goroutine。
 	go func() {
 		for {
+			select {
+			case <-rf.killCh:
+				return
+			default:
+			}
 			// 选举超时时间，因为是随机选取，所以要在协程中定义
 			electionTime := time.Duration(rand.Intn(200) + 300) * time.Millisecond
 			// 读取状态要加锁
