@@ -16,6 +16,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Cid    int64  // 每个客户端的唯一标识符
+	SeqNum int    // 用单调递增的序列号标记每个请求。
 }
 
 type PutAppendReply struct {
